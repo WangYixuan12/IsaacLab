@@ -22,6 +22,43 @@ from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
 class FactoryEnv(DirectRLEnv):
     cfg: FactoryEnvCfg
 
+    @staticmethod
+    def _get_physics_backend(cfg: FactoryEnvCfg) -> str:
+        physics_type = type(cfg.sim.physics).__name__
+        if physics_type in ("PhysxCfg", "OvPhysxCfg"):
+            return "physx"
+        if physics_type == "NewtonCfg":
+            return "newton"
+        raise ValueError(f"Unsupported physics backend: {physics_type}")
+
+    @staticmethod
+    def _configure_newton_gravity_compensation(cfg: FactoryEnvCfg) -> None:
+        from isaaclab_newton.sim.schemas.schemas_cfg import MujocoJointDrivePropertiesCfg, MujocoRigidBodyPropertiesCfg
+
+        cfg.robot.spawn.rigid_props = MujocoRigidBodyPropertiesCfg(gravcomp=1.0)
+        cfg.robot.spawn.joint_drive_props = MujocoJointDrivePropertiesCfg(
+            actuatorgravcomp=True,
+            ensure_drives_exist=True,
+        )
+        held_rigid_props = cfg.task.held_asset.spawn.rigid_props
+        if not isinstance(held_rigid_props, MujocoRigidBodyPropertiesCfg) or held_rigid_props.gravcomp is None:
+            cfg.task.held_asset.spawn.rigid_props = MujocoRigidBodyPropertiesCfg(gravcomp=1.0)
+
+    @staticmethod
+    def _configure_newton_gear_mesh_collisions(cfg: FactoryEnvCfg) -> None:
+        from isaaclab_newton.sim.schemas.schemas_cfg import NewtonMeshCollisionPropertiesCfg
+
+        mesh_collision_props = NewtonMeshCollisionPropertiesCfg(
+            mesh_approximation_name="convexHull",
+            max_hull_vertices=-1,
+        )
+        asset_cfgs = [cfg.task.fixed_asset, cfg.task.held_asset]
+        if cfg.task.name == "gear_mesh":
+            asset_cfgs += [cfg.task.small_gear_cfg, cfg.task.large_gear_cfg]
+
+        for asset_cfg in asset_cfgs:
+            asset_cfg.spawn.collision_props.mesh_collision_property = mesh_collision_props
+
     def __init__(self, cfg: FactoryEnvCfg, render_mode: str | None = None, **kwargs):
         # Update number of obs/states
         cfg.observation_space = sum([OBS_DIM_CFG[obs] for obs in cfg.obs_order])
@@ -29,6 +66,10 @@ class FactoryEnv(DirectRLEnv):
         cfg.observation_space += cfg.action_space
         cfg.state_space += cfg.action_space
         self.cfg_task = cfg.task
+        self.physics_backend = self._get_physics_backend(cfg)
+        if self.physics_backend == "newton":
+            self._configure_newton_gravity_compensation(cfg)
+            self._configure_newton_gear_mesh_collisions(cfg)
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -205,6 +246,27 @@ class FactoryEnv(DirectRLEnv):
         self.ep_succeeded[env_ids] = 0
         self.ep_success_times[env_ids] = 0
 
+    def _set_sim_gravity(self, gravity):
+        sim = sim_utils.SimulationContext.instance()
+        if self.physics_backend == "physx":
+            sim.physics_sim_view.set_gravity(carb.Float3(*gravity))
+            return
+
+        if self.physics_backend == "newton":
+            from newton.solvers import SolverNotifyFlags
+
+            physics_manager = sim.physics_manager
+            physics_manager.get_model().set_gravity(tuple(gravity))
+            physics_manager.add_model_change(SolverNotifyFlags.MODEL_PROPERTIES)
+            return
+
+        raise ValueError(f"Unsupported physics backend: {self.physics_backend}")
+
+    def _get_gripper_close_pos(self) -> float:
+        if self.physics_backend == "newton":
+            return self.cfg_task.held_asset_cfg.diameter / 2.0
+        return 0.0
+
     def _pre_physics_step(self, action):
         """Apply policy actions with smoothing."""
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
@@ -248,7 +310,7 @@ class FactoryEnv(DirectRLEnv):
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
             ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
-            ctrl_target_gripper_dof_pos=0.0,
+            ctrl_target_gripper_dof_pos=self._get_gripper_close_pos(),
         )
 
     def _apply_action(self):
@@ -299,21 +361,27 @@ class FactoryEnv(DirectRLEnv):
         self.generate_ctrl_signals(
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
             ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
-            ctrl_target_gripper_dof_pos=0.0,
+            ctrl_target_gripper_dof_pos=self._get_gripper_close_pos(),
         )
 
     def generate_ctrl_signals(
         self, ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, ctrl_target_gripper_dof_pos
     ):
         """Get Jacobian. Set Franka DOF position targets (fingers) or DOF torques (arm)."""
+        fingertip_midpoint_linvel = self.fingertip_midpoint_linvel
+        fingertip_midpoint_angvel = self.fingertip_midpoint_angvel
+        if self.physics_backend == "newton":
+            fingertip_midpoint_linvel = self.ee_linvel_fd
+            fingertip_midpoint_angvel = self.ee_angvel_fd
+
         self.joint_torque, self.applied_wrench = factory_control.compute_dof_torque(
             cfg=self.cfg,
             dof_pos=self.joint_pos,
             dof_vel=self.joint_vel,
             fingertip_midpoint_pos=self.fingertip_midpoint_pos,
             fingertip_midpoint_quat=self.fingertip_midpoint_quat,
-            fingertip_midpoint_linvel=self.fingertip_midpoint_linvel,
-            fingertip_midpoint_angvel=self.fingertip_midpoint_angvel,
+            fingertip_midpoint_linvel=fingertip_midpoint_linvel,
+            fingertip_midpoint_angvel=fingertip_midpoint_angvel,
             jacobian=self.fingertip_midpoint_jacobian,
             arm_mass_matrix=self.arm_mass_matrix,
             ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
@@ -323,7 +391,6 @@ class FactoryEnv(DirectRLEnv):
             device=self.device,
             dead_zone_thresholds=self.dead_zone_thresholds,
         )
-
         # set target for gripper joints to use physx's PD controller
         self.ctrl_target_joint_pos[:, 7:9] = ctrl_target_gripper_dof_pos
         self.joint_torque[:, 7:9] = 0.0
@@ -620,9 +687,7 @@ class FactoryEnv(DirectRLEnv):
 
     def randomize_initial_state(self, env_ids):
         """Randomize initial state and perform any episode-level randomization."""
-        # Disable gravity.
-        physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
-        physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+        self._set_sim_gravity((0.0, 0.0, 0.0))
 
         # (1.) Randomize fixed asset pose.
         fixed_pose = self._fixed_asset.data.default_root_pose.torch.clone()[env_ids]
@@ -733,9 +798,11 @@ class FactoryEnv(DirectRLEnv):
 
         # Add flanking gears after servo (so arm doesn't move them).
         if self.cfg_task.name == "gear_mesh" and self.cfg_task.add_flanking_gears:
+            flanking_gear_height_offset = self.cfg_task.flanking_gear_init_height_offset
             small_gear_pose = self._small_gear_asset.data.default_root_pose.torch.clone()[env_ids]
             small_gear_vel = self._small_gear_asset.data.default_root_vel.torch.clone()[env_ids]
             small_gear_pose[:, 0:7] = fixed_pose[:, 0:7]
+            small_gear_pose[:, 2] += flanking_gear_height_offset
             small_gear_vel[:] = 0.0  # vel
             self._small_gear_asset.write_root_pose_to_sim_index(root_pose=small_gear_pose, env_ids=env_ids)
             self._small_gear_asset.write_root_velocity_to_sim_index(root_velocity=small_gear_vel, env_ids=env_ids)
@@ -744,6 +811,7 @@ class FactoryEnv(DirectRLEnv):
             large_gear_pose = self._large_gear_asset.data.default_root_pose.torch.clone()[env_ids]
             large_gear_vel = self._large_gear_asset.data.default_root_vel.torch.clone()[env_ids]
             large_gear_pose[:, 0:7] = fixed_pose[:, 0:7]
+            large_gear_pose[:, 2] += flanking_gear_height_offset
             large_gear_vel[:] = 0.0  # vel
             self._large_gear_asset.write_root_pose_to_sim_index(root_pose=large_gear_pose, env_ids=env_ids)
             self._large_gear_asset.write_root_velocity_to_sim_index(root_velocity=large_gear_vel, env_ids=env_ids)
@@ -807,7 +875,7 @@ class FactoryEnv(DirectRLEnv):
 
         grasp_time = 0.0
         while grasp_time < 0.25:
-            self.ctrl_target_joint_pos[env_ids, 7:] = 0.0  # Close gripper.
+            self.ctrl_target_joint_pos[env_ids, 7:] = self._get_gripper_close_pos()  # Close gripper.
             self.close_gripper_in_place()
             self.step_sim_no_action()
             grasp_time += self.sim.get_physics_dt()
@@ -828,4 +896,4 @@ class FactoryEnv(DirectRLEnv):
         self.task_prop_gains = self.default_gains
         self.task_deriv_gains = factory_utils.get_deriv_gains(self.default_gains)
 
-        physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))
+        self._set_sim_gravity(self.cfg.sim.gravity)

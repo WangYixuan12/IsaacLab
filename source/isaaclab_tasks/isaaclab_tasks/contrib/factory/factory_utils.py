@@ -31,6 +31,15 @@ def wrap_yaw(angle):
 
 def set_friction(asset, value, num_envs):
     """Update material properties for a given asset."""
+    if not hasattr(asset.root_view, "get_material_properties"):
+        from isaaclab_newton.physics import NewtonManager as SimulationManager
+        from newton.solvers import SolverNotifyFlags
+
+        friction = asset.root_view.get_attribute("shape_material_mu", SimulationManager.get_model())[:, 0]
+        wp.to_torch(friction)[:] = value
+        SimulationManager.add_model_change(SolverNotifyFlags.SHAPE_PROPERTIES)
+        return
+
     materials = wp.to_torch(asset.root_view.get_material_properties())
     materials[..., 0] = value  # Static friction.
     materials[..., 1] = value  # Dynamic friction.
@@ -42,11 +51,11 @@ def set_friction(asset, value, num_envs):
 
 def set_body_inertias(robot, num_envs):
     """Note: this is to account for the asset_options.armature parameter in IGE."""
-    inertias = wp.to_torch(robot.root_view.get_inertias())
+    inertias = robot.data.body_inertia.torch.clone()
     offset = torch.zeros_like(inertias)
     offset[:, :, [0, 4, 8]] += 0.01
     new_inertias = inertias + offset
-    robot.root_view.set_inertias(wp.from_torch(new_inertias), wp.from_torch(torch.arange(num_envs, dtype=torch.int32)))
+    robot.set_inertias_index(inertias=new_inertias, env_ids=torch.arange(num_envs, device=robot.device))
 
 
 def get_held_base_pos_local(task_name, fixed_asset_cfg, num_envs, device):
